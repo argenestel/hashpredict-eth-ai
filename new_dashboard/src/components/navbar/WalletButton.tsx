@@ -3,6 +3,8 @@ import { Wallet, ChevronDown, Loader2 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { usePrivy, useWallets } from '@privy-io/react-auth';
 import { formatEther } from 'viem';
+import {getBalance} from "@wagmi/core";
+import { config } from 'config';
 
 const WalletButton = () => {
   const { ready, user, authenticated, login, logout } = usePrivy();
@@ -13,13 +15,15 @@ const WalletButton = () => {
 
   // Get the first embedded wallet or first connected wallet
   const activeWallet = wallets?.[0];
-
   useEffect(() => {
     const fetchBalance = async () => {
       if (activeWallet?.address) {
         try {
-          const balance = await activeWallet.getEthBalance();
-          setBalance(formatEther(BigInt(balance)).slice(0, 6));
+
+          const balance = getBalance(config, {
+  address: activeWallet?.address,
+})
+          setBalance("0");
         } catch (err) {
           console.error('Error fetching balance:', err);
         }

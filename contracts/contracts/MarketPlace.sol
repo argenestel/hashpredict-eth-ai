@@ -1,414 +1,634 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/access/AccessControl.sol";
+import "./Market.sol";
+// Position Token Contract
 
-contract PredictionMarketplace is AccessControl {
+// Main Prediction Market Contract
+contract AdvancedPredictionMarket is AccessControl {
     // Roles
     bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
-    bytes32 public constant MOD_ROLE = keccak256("MOD_ROLE");
     bytes32 public constant ORACLE_ROLE = keccak256("ORACLE_ROLE");
-    bytes32 public constant PREDICTOR_ROLE = keccak256("PREDICTOR_ROLE");
-
-    // Enums
-    enum PredictionType { BINARY, MULTIPLE_CHOICE, RANGE }
-    enum PredictionStatus { ACTIVE, FINALIZED, CANCELLED }
+    bytes32 public constant CREATOR_ROLE = keccak256("CREATOR_ROLE");
+    bytes32 public constant MODERATOR_ROLE = keccak256("MODERATOR_ROLE");
 
     // Constants
-    uint256 public constant VOTE_VALUE = 0.001 ether;
+    uint256 public constant CREATOR_FEE_PERCENTAGE = 20; // 2%
+    uint256 public constant PLATFORM_FEE_PERCENTAGE = 10; // 1%
+    uint256 public constant DISPUTE_PERIOD = 3 days;
+    uint256 public constant MIN_STAKE = 0.001 ether;
+    uint256 public constant MAX_STAKE = 100 ether;
+
+    // Enums
+    enum MarketStatus {
+        Active,
+        Resolved,
+        Disputed,
+        Cancelled
+    }
+    enum OrderType {
+        Market,
+        Limit
+    }
+    enum DisputeStatus {
+        None,
+        Active,
+        Resolved
+    }
 
     // Structs
-    struct Prediction {
+    struct UserPosition {
+        uint256 yesTokens;
+        uint256 noTokens;
+        uint256 totalInvested;
+        uint256[] limitOrders;
+    }
+
+    struct Profile {
+        string username;
+        string avatarIpfsHash;
+        string bio;
+        uint256 reputation;
+        uint256[] createdMarkets;
+        uint256[] participatedMarkets;
+        uint256 totalProfits;
+        uint256 creatorEarnings;
+        bool isActive;
+        bool isCreator;
+        address[] followers;
+        address[] following;
+        mapping(uint256 => UserPosition) positions;
+    }
+
+    struct Market {
         string description;
-        uint256 endTime;
-        PredictionStatus status;
-        uint256[] totalVotes;
-        mapping(address => uint256[]) userVotes;
-        uint256 outcome;
-        uint256 minVotes;
-        uint256 maxVotes;
-        PredictionType predictionType;
-        address creator;
-        uint256 creationTime;
+        string category;
         string[] tags;
-        uint256 optionsCount;
-        uint256 totalBetAmount;
+        uint256 endTime;
+        uint256 resolutionTime;
+        MarketStatus status;
+        address creator;
+        address yesToken;
+        address noToken;
+        uint256 yesPrice;
+        uint256 noPrice;
+        bool outcome;
+        uint256 totalLiquidity;
+        uint256 totalVolume;
+        uint256 totalParticipants;
+        uint256 creatorFees;
+        uint256 platformFees;
+        DisputeStatus disputeStatus;
+        string imageIpfsHash;
+        mapping(address => UserPosition) positions;
+        mapping(address => bool) hasParticipated;
+        mapping(uint256 => Comment) comments;
+        uint256 commentCount;
+        mapping(uint256 => LimitOrder) limitOrders;
+        uint256 limitOrderCount;
     }
 
-    struct UserStats {
-        uint256 totalVotes;
-        uint256 wonVotes;
-        uint256 totalAmountBet;
-        uint256 totalAmountWon;
-        uint256 luck;
+    struct Comment {
+        address author;
+        string content;
+        uint256 timestamp;
+        uint256[] replies;
+        uint256 likes;
+        mapping(address => bool) hasLiked;
     }
 
-    // State variables
-    uint256 public predictionCounter;
-    mapping(uint256 => Prediction) public predictions;
-    mapping(address => UserStats) public userStats;
-    mapping(string => bool) public validTags;
-    mapping(uint256 => mapping(address => bool)) public userParticipation;
+    struct LimitOrder {
+        address creator;
+        OrderType orderType;
+        bool isYes;
+        uint256 amount;
+        uint256 targetPrice;
+        bool isActive;
+        uint256 timestamp;
+    }
 
-    uint256 public constant FEE_PERCENTAGE = 25; // 2.5% fee (25/1000)
-    uint256 public totalFees;
-    uint256 public constant MAX_OPTIONS = 10; // Maximum number of options for multiple choice predictions
+    struct MarketDispute {
+        address disputer;
+        string reason;
+        uint256 stake;
+        uint256 timestamp;
+        mapping(address => bool) votes;
+        uint256 yesVotes;
+        uint256 noVotes;
+        bool resolved;
+    }
 
-    address[] public luckiestUsers;
+    // State Variables
+    mapping(address => Profile) public profiles;
+    mapping(uint256 => Market) public markets;
+    mapping(uint256 => MarketDispute) public disputes;
+    mapping(string => uint256[]) public categoryToMarkets;
+    mapping(string => bool) public verifiedCategories;
+    mapping(address => bool) public verifiedCreators;
+
+    uint256 private _marketIds;
+    uint256 public minMarketDuration;
+    uint256 public maxMarketDuration;
+    uint256 public totalPlatformFees;
+    uint256 public disputeResolutionThreshold;
 
     // Events
-    event PredictionCreated(uint256 indexed predictionId, address indexed creator, string description, uint256 endTime, PredictionType predictionType);
-    event VotesPlaced(uint256 indexed predictionId, address indexed user, uint256 option, uint256 votes);
-    event PredictionFinalized(uint256 indexed predictionId, uint256 outcome);
-    event RewardsDistributed(uint256 indexed predictionId, address[] winners, uint256[] amounts);
-    event PredictionCancelled(uint256 indexed predictionId);
-    event FeeWithdrawn(address indexed to, uint256 amount);
-    event PartialWithdrawal(uint256 indexed predictionId, address indexed user, uint256 votes);
-    event TagAdded(string tag);
-    event TagRemoved(string tag);
-    event LuckUpdated(address indexed user, uint256 newLuck);
+    event ProfileCreated(address indexed user, string username);
+    event MarketCreated(uint256 indexed marketId, string description, address creator);
+    event PositionTaken(uint256 indexed marketId, address user, bool isYes, uint256 amount);
+    event PositionExited(uint256 indexed marketId, address user, bool isYes, uint256 amount, uint256 reward);
+    event MarketResolved(uint256 indexed marketId, bool outcome);
+    event DisputeCreated(uint256 indexed marketId, address disputer, string reason);
+    event DisputeResolved(uint256 indexed marketId, bool originalOutcomeStood);
+    event LimitOrderCreated(
+        uint256 indexed marketId, uint256 orderId, address creator, bool isYes, uint256 amount, uint256 targetPrice
+    );
+    event LimitOrderFilled(uint256 indexed marketId, uint256 orderId);
+    event CommentAdded(uint256 indexed marketId, uint256 commentId, address author);
+    event MarketCategorized(uint256 indexed marketId, string category);
 
     constructor() {
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
         _grantRole(ADMIN_ROLE, msg.sender);
-        _grantRole(PREDICTOR_ROLE, msg.sender);
         _grantRole(ORACLE_ROLE, msg.sender);
+        _grantRole(MODERATOR_ROLE, msg.sender); // Changed from _setupRole
+
+        minMarketDuration = 1 days;
+        maxMarketDuration = 365 days;
+        disputeResolutionThreshold = 100;
     }
 
     // Modifiers
-    modifier onlyValidPrediction(uint256 _predictionId) {
-        require(predictions[_predictionId].status == PredictionStatus.ACTIVE, "Prediction is not active");
-        require(block.timestamp < predictions[_predictionId].endTime, "Prediction has ended");
+    modifier onlyVerifiedCreator() {
+        require(
+            hasRole(CREATOR_ROLE, msg.sender) || verifiedCreators[msg.sender]
+                || (profiles[msg.sender].isCreator && profiles[msg.sender].reputation >= 500),
+            "Must be verified creator"
+        );
         _;
     }
 
-    // Functions
-    function createPrediction(
+    modifier marketExists(uint256 marketId) {
+        require(marketId < _marketIds, "Market doesn't exist");
+        _;
+    }
+
+    modifier activeMarket(uint256 marketId) {
+        require(markets[marketId].status == MarketStatus.Active, "Market not active");
+        _;
+    }
+
+    // Profile Management Functions
+    function createProfile(string memory _username, string memory _avatarIpfsHash, string memory _bio) external {
+        require(!profiles[msg.sender].isActive, "Profile exists");
+        require(bytes(_username).length > 0, "Empty username");
+
+        Profile storage newProfile = profiles[msg.sender];
+        newProfile.username = _username;
+        newProfile.avatarIpfsHash = _avatarIpfsHash;
+        newProfile.bio = _bio;
+        newProfile.isActive = true;
+        newProfile.reputation = 100;
+
+        emit ProfileCreated(msg.sender, _username);
+    }
+
+    function followUser(address userToFollow) external {
+        require(profiles[msg.sender].isActive, "Create profile first");
+        require(profiles[userToFollow].isActive, "User to follow doesn't exist");
+        require(msg.sender != userToFollow, "Can't follow self");
+
+        profiles[msg.sender].following.push(userToFollow);
+        profiles[userToFollow].followers.push(msg.sender);
+    }
+
+    // Market Creation and Management
+    function createMarket(
         string memory _description,
+        string memory _category,
         uint256 _duration,
-        uint256 _minVotes,
-        uint256 _maxVotes,
-        PredictionType _type,
-        uint256 _optionsCount,
+        string memory _imageIpfsHash,
         string[] memory _tags
-    ) external onlyRole(PREDICTOR_ROLE) {
-        require(_optionsCount >= 2 && _optionsCount <= MAX_OPTIONS, "Invalid number of options");
-        require(_minVotes > 0 && _maxVotes >= _minVotes, "Invalid vote limits");
-        
-        uint256 predictionId = predictionCounter++;
+    ) external payable onlyVerifiedCreator {
+        require(msg.value >= MIN_STAKE, "Insufficient stake");
+        require(_duration >= minMarketDuration && _duration <= maxMarketDuration, "Invalid duration");
+        require(verifiedCategories[_category], "Invalid category");
 
-        Prediction storage newPrediction = predictions[predictionId];
-        newPrediction.description = _description;
-        newPrediction.endTime = block.timestamp + _duration;
-        newPrediction.status = PredictionStatus.ACTIVE;
-        newPrediction.minVotes = _minVotes;
-        newPrediction.maxVotes = _maxVotes;
-        newPrediction.predictionType = _type;
-        newPrediction.creator = msg.sender;
-        newPrediction.creationTime = block.timestamp;
-        newPrediction.optionsCount = _optionsCount;
+        uint256 marketId = _marketIds;
+        _marketIds++;
 
-        for (uint256 i = 0; i < _optionsCount; i++) {
-            newPrediction.totalVotes.push(0);
-        }
+        Market storage market = markets[marketId];
+        market.description = _description;
+        market.category = _category;
+        market.tags = _tags;
+        market.endTime = block.timestamp + _duration;
+        market.creator = msg.sender;
+        market.status = MarketStatus.Active;
+        market.totalLiquidity = msg.value;
+        market.imageIpfsHash = _imageIpfsHash;
 
-        for (uint256 i = 0; i < _tags.length; i++) {
-            newPrediction.tags.push(_tags[i]);
-        }
+        // Create position tokens
+        string memory baseTokenName = string(abi.encodePacked("Market ", toString(marketId)));
+        market.yesToken = address(
+            new MarketPositionToken(
+                string(abi.encodePacked(baseTokenName, " YES")),
+                string(abi.encodePacked("MKT", toString(marketId), "YES")),
+                address(this)
+            )
+        );
+        market.noToken = address(
+            new MarketPositionToken(
+                string(abi.encodePacked(baseTokenName, " NO")),
+                string(abi.encodePacked("MKT", toString(marketId), "NO")),
+                address(this)
+            )
+        );
 
-        emit PredictionCreated(predictionId, msg.sender, _description, newPrediction.endTime, _type);
+        // Initialize prices
+        market.yesPrice = 500;
+        market.noPrice = 500;
+
+        // Update creator profile
+        profiles[msg.sender].createdMarkets.push(marketId);
+        categoryToMarkets[_category].push(marketId);
+
+        emit MarketCreated(marketId, _description, msg.sender);
+        emit MarketCategorized(marketId, _category);
     }
 
-    function placeVotes(uint256 _predictionId, uint256 _option, uint256 _votes) external payable onlyValidPrediction(_predictionId) {
-        Prediction storage prediction = predictions[_predictionId];
-        require(_option < prediction.optionsCount, "Invalid option");
-        require(_votes >= prediction.minVotes && _votes <= prediction.maxVotes, "Votes out of range");
-        require(msg.value == _votes * VOTE_VALUE, "Incorrect ETH amount");
+    // Trading Functions
+    function takePosition(uint256 marketId, bool isYes, uint256 targetPrice) external payable activeMarket(marketId) {
+        require(msg.value >= MIN_STAKE && msg.value <= MAX_STAKE, "Invalid stake amount");
 
-        prediction.totalVotes[_option] += _votes;
-        prediction.userVotes[msg.sender].push(_votes);
-        prediction.totalBetAmount += msg.value;
+        Market storage market = markets[marketId];
+        require(block.timestamp < market.endTime, "Market ended");
 
-        userStats[msg.sender].totalVotes += _votes;
-        userStats[msg.sender].totalAmountBet += msg.value;
-        userParticipation[_predictionId][msg.sender] = true;
+        // Calculate fees and tokens
+        uint256 creatorFee = (msg.value * CREATOR_FEE_PERCENTAGE) / 1000;
+        uint256 platformFee = (msg.value * PLATFORM_FEE_PERCENTAGE) / 1000;
+        uint256 netAmount = msg.value - creatorFee - platformFee;
 
-        updateLuckiestUsers(msg.sender);
+        uint256 currentPrice = getCurrentPrice(marketId, isYes);
+        require(targetPrice == 0 || currentPrice <= targetPrice, "Price too high");
 
-        emit VotesPlaced(_predictionId, msg.sender, _option, _votes);
-    }
+        uint256 tokenAmount = (netAmount * 1000) / currentPrice;
 
-    function partialWithdraw(uint256 _predictionId, uint256 _votes) external onlyValidPrediction(_predictionId) {
-        Prediction storage prediction = predictions[_predictionId];
-        uint256 userTotalVotes = 0;
-        for (uint256 i = 0; i < prediction.userVotes[msg.sender].length; i++) {
-            userTotalVotes += prediction.userVotes[msg.sender][i];
-        }
-        require(_votes <= userTotalVotes, "Withdrawal votes exceed bet");
-
-        uint256 penalty = (_votes * 10) / 100; // 10% penalty
-        uint256 withdrawalVotes = _votes - penalty;
-        uint256 withdrawalAmount = withdrawalVotes * VOTE_VALUE;
-
-        // Update user's votes and total votes
-        uint256 remainingWithdrawal = _votes;
-        for (uint256 i = 0; i < prediction.optionsCount; i++) {
-            if (remainingWithdrawal == 0) break;
-            if (prediction.userVotes[msg.sender][i] > 0) {
-                uint256 withdrawFromOption = remainingWithdrawal > prediction.userVotes[msg.sender][i] ?
-                    prediction.userVotes[msg.sender][i] : remainingWithdrawal;
-                prediction.userVotes[msg.sender][i] -= withdrawFromOption;
-                prediction.totalVotes[i] -= withdrawFromOption;
-                remainingWithdrawal -= withdrawFromOption;
-            }
-        }
-
-        prediction.totalBetAmount -= withdrawalAmount + (penalty * VOTE_VALUE);
-        totalFees += penalty * VOTE_VALUE;
-        payable(msg.sender).transfer(withdrawalAmount);
-
-        emit PartialWithdrawal(_predictionId, msg.sender, withdrawalVotes);
-    }
-
-    function finalizePrediction(uint256 _predictionId, uint256 _outcome) external onlyRole(ORACLE_ROLE) {
-        Prediction storage prediction = predictions[_predictionId];
-        require(prediction.status == PredictionStatus.ACTIVE, "Prediction is not active");
-        require(block.timestamp >= prediction.endTime, "Prediction has not ended yet");
-        require(_outcome < prediction.optionsCount, "Invalid outcome");
-
-        prediction.status = PredictionStatus.FINALIZED;
-        prediction.outcome = _outcome;
-
-        emit PredictionFinalized(_predictionId, _outcome);
-    }
-
-    function distributeRewards(uint256 _predictionId) external onlyRole(ADMIN_ROLE) {
-        Prediction storage prediction = predictions[_predictionId];
-        require(prediction.status == PredictionStatus.FINALIZED, "Prediction is not finalized");
-
-        uint256 fee = (prediction.totalBetAmount * FEE_PERCENTAGE) / 1000;
-        uint256 winningVotes = prediction.totalVotes[prediction.outcome];
-        uint256 rewardPool = prediction.totalBetAmount - fee;
-
-        totalFees += fee;
-
-        address[] memory winners = new address[](predictionCounter);
-        uint256[] memory amounts = new uint256[](predictionCounter);
-        uint256 winnerCount = 0;
-
-        for (uint256 i = 0; i < predictionCounter; i++) {
-            address participant = address(uint160(i));
-            if (userParticipation[_predictionId][participant]) {
-                uint256 participantVotes = prediction.userVotes[participant][prediction.outcome];
-                if (participantVotes > 0) {
-                    uint256 reward = (participantVotes * rewardPool) / winningVotes;
-                    payable(participant).transfer(reward);
-                    userStats[participant].wonVotes += participantVotes;
-                    userStats[participant].totalAmountWon += reward;
-                    winners[winnerCount] = participant;
-                    amounts[winnerCount] = reward;
-                    winnerCount++;
-
-                    updateLuck(participant, true);
-                } else {
-                    updateLuck(participant, false);
-                }
-            }
-        }
-
-        // Resize arrays to actual winner count
-        assembly {
-            mstore(winners, winnerCount)
-            mstore(amounts, winnerCount)
-        }
-
-        emit RewardsDistributed(_predictionId, winners, amounts);
-    }
-
-    function updateLuck(address _user, bool _won) internal {
-        UserStats storage stats = userStats[_user];
-        if (_won) {
-            stats.luck += 10;
+        // Update position
+        UserPosition storage position = market.positions[msg.sender];
+        if (isYes) {
+            position.yesTokens += tokenAmount;
         } else {
-            if (stats.luck >= 5) {
-                stats.luck -= 5;
-            } else {
-                stats.luck = 0;
-            }
+            position.noTokens += tokenAmount;
         }
-        emit LuckUpdated(_user, stats.luck);
-        updateLuckiestUsers(_user);
+        position.totalInvested += msg.value;
+
+        // Update market state
+        market.creatorFees += creatorFee;
+        market.platformFees += platformFee;
+        market.totalLiquidity += netAmount;
+        market.totalVolume += msg.value;
+
+        if (!market.hasParticipated[msg.sender]) {
+            market.totalParticipants++;
+            market.hasParticipated[msg.sender] = true;
+        }
+
+        // Mint tokens
+        MarketPositionToken token = MarketPositionToken(isYes ? market.yesToken : market.noToken);
+        token.mint(msg.sender, tokenAmount);
+
+        // Update prices
+        updatePrices(marketId);
+
+        // Try to fill limit orders
+        tryFillLimitOrders(marketId, !isYes);
+
+        emit PositionTaken(marketId, msg.sender, isYes, tokenAmount);
     }
 
-    function updateLuckiestUsers(address _user) internal {
-        uint256 userLuck = userStats[_user].luck;
-        uint256 leaderboardLength = luckiestUsers.length;
+    function tryFillLimitOrders(uint256 marketId, bool isYes) internal {
+        Market storage market = markets[marketId];
+        uint256 currentPrice = getCurrentPrice(marketId, isYes);
 
-        for (uint256 i = 0; i < leaderboardLength; i++) {
-            if (luckiestUsers[i] == _user) {
-                // User is already in leaderboard, remove them
-                for (uint256 j = i; j < leaderboardLength - 1; j++) {
-                    luckiestUsers[j] = luckiestUsers[j + 1];
+        for (uint256 i = 0; i < market.limitOrderCount; i++) {
+            LimitOrder storage order = market.limitOrders[i];
+
+            if (!order.isActive || order.isYes != isYes) continue;
+
+            // Check if the current price meets the target price
+            if (isYes && currentPrice <= order.targetPrice || !isYes && currentPrice >= order.targetPrice) {
+                // Fill the order
+                UserPosition storage position = market.positions[order.creator];
+
+                if (isYes) {
+                    position.yesTokens += order.amount;
+                } else {
+                    position.noTokens += order.amount;
                 }
-                luckiestUsers.pop();
-                break;
+
+                // Mint tokens
+                MarketPositionToken token = MarketPositionToken(isYes ? market.yesToken : market.noToken);
+                token.mint(order.creator, order.amount);
+
+                // Mark order as filled
+                order.isActive = false;
+
+                emit LimitOrderFilled(marketId, i);
+
+                // Update market state
+                market.totalVolume += order.amount;
+                updatePrices(marketId);
             }
         }
-
-        // Find the correct position to insert the user
-        for (uint256 i = 0; i < luckiestUsers.length; i++) {
-            if (userStats[luckiestUsers[i]].luck < userLuck) {
-                luckiestUsers.push(address(0)); // Extend array
-                for (uint256 j = luckiestUsers.length - 1; j > i; j--) {
-                    luckiestUsers[j] = luckiestUsers[j - 1];
-                }
-                luckiestUsers[i] = _user;
-                return;
-            }
-        }
-
-        // If not inserted, add to the end
-        luckiestUsers.push(_user);
     }
 
-    function getLuckiestUsers(uint256 _limit) external view returns (address[] memory, uint256[] memory) {
-        require(_limit > 0 && _limit <= luckiestUsers.length, "Invalid limit");
-        address[] memory topUsers = new address[](_limit);
-        uint256[] memory luckScores = new uint256[](_limit);
+    function createLimitOrder(uint256 marketId, bool isYes, uint256 amount, uint256 targetPrice)
+        external
+        payable
+        activeMarket(marketId)
+    {
+        require(msg.value >= MIN_STAKE && msg.value <= MAX_STAKE, "Invalid stake amount");
+        require(targetPrice > 0 && targetPrice <= 1000, "Invalid target price");
 
-        for (uint256 i = 0; i < _limit; i++) {
-            topUsers[i] = luckiestUsers[i];
-            luckScores[i] = userStats[luckiestUsers[i]].luck;
-        }
+        Market storage market = markets[marketId];
+        uint256 orderId = market.limitOrderCount++;
 
-        return (topUsers, luckScores);
+        LimitOrder storage order = market.limitOrders[orderId];
+        order.creator = msg.sender;
+        order.orderType = OrderType.Limit;
+        order.isYes = isYes;
+        order.amount = amount;
+        order.targetPrice = targetPrice;
+        order.isActive = true;
+        order.timestamp = block.timestamp;
+
+        market.positions[msg.sender].limitOrders.push(orderId);
+
+        emit LimitOrderCreated(marketId, orderId, msg.sender, isYes, amount, targetPrice);
     }
 
-    function cancelPrediction(uint256 _predictionId) external onlyRole(ADMIN_ROLE) {
-        Prediction storage prediction = predictions[_predictionId];
-        require(prediction.status == PredictionStatus.ACTIVE, "Prediction is not active");
+    function cancelLimitOrder(uint256 marketId, uint256 orderId) external {
+        Market storage market = markets[marketId];
+        LimitOrder storage order = market.limitOrders[orderId];
 
-        prediction.status = PredictionStatus.CANCELLED;
+        require(order.creator == msg.sender, "Not order creator");
+        require(order.isActive, "Order not active");
 
-        // Refund all participants
-        for (uint256 i = 0; i < predictionCounter; i++) {
+        order.isActive = false;
+
+        // Refund locked stake
+        payable(msg.sender).transfer(order.amount);
+    }
+
+    // Resolution and Dispute Functions
+    function resolveMarket(uint256 marketId, bool outcome) external onlyRole(ORACLE_ROLE) {
+        Market storage market = markets[marketId];
+        require(market.status == MarketStatus.Active, "Invalid status");
+        require(block.timestamp >= market.endTime, "Market not ended");
+
+        market.status = MarketStatus.Resolved;
+        market.outcome = outcome;
+        market.resolutionTime = block.timestamp;
+
+        // Start dispute period
+        disputes[marketId].timestamp = block.timestamp;
+
+        emit MarketResolved(marketId, outcome);
+    }
+
+    function createDispute(uint256 marketId, string memory reason) external payable {
+        Market storage market = markets[marketId];
+        require(market.status == MarketStatus.Resolved, "Not resolved");
+        require(block.timestamp <= market.resolutionTime + DISPUTE_PERIOD, "Dispute period ended");
+        require(msg.value >= MIN_STAKE, "Insufficient stake");
+
+        MarketDispute storage dispute = disputes[marketId];
+        require(dispute.disputer == address(0), "Dispute exists");
+
+        dispute.disputer = msg.sender;
+        dispute.reason = reason;
+        dispute.stake = msg.value;
+        dispute.timestamp = block.timestamp;
+
+        market.status = MarketStatus.Disputed;
+        market.disputeStatus = DisputeStatus.Active;
+
+        emit DisputeCreated(marketId, msg.sender, reason);
+    }
+
+    function voteOnDispute(uint256 marketId, bool supportDispute) external {
+        Market storage market = markets[marketId];
+        MarketDispute storage dispute = disputes[marketId];
+
+        require(market.status == MarketStatus.Disputed, "Not disputed");
+        require(!dispute.votes[msg.sender], "Already voted");
+        require(market.hasParticipated[msg.sender], "Must be participant");
+
+        dispute.votes[msg.sender] = true;
+        if (supportDispute) {
+            dispute.yesVotes++;
+        } else {
+            dispute.noVotes++;
+        }
+
+        // Check if threshold reached
+        if (dispute.yesVotes + dispute.noVotes >= disputeResolutionThreshold) {
+            resolveDispute(marketId);
+        }
+    }
+
+    function resolveDispute(uint256 marketId) internal {
+        Market storage market = markets[marketId];
+        MarketDispute storage dispute = disputes[marketId];
+
+        bool originalOutcomeStood = dispute.noVotes >= dispute.yesVotes;
+
+        if (!originalOutcomeStood) {
+            market.outcome = !market.outcome;
+            // Refund dispute stake
+            payable(dispute.disputer).transfer(dispute.stake);
+        }
+
+        market.status = MarketStatus.Resolved;
+        market.disputeStatus = DisputeStatus.Resolved;
+        dispute.resolved = true;
+
+        // Distribute rewards
+        distributeRewards(marketId);
+
+        emit DisputeResolved(marketId, originalOutcomeStood);
+    }
+
+    // Market Trading Helper Functions
+    function distributeRewards(uint256 marketId) internal {
+        Market storage market = markets[marketId];
+        MarketPositionToken winningToken = MarketPositionToken(market.outcome ? market.yesToken : market.noToken);
+
+        uint256 totalLiquidity = market.totalLiquidity;
+        uint256 totalSupply = winningToken.totalSupply();
+
+        if (totalSupply == 0) return;
+
+        // Distribute to winning position holders
+        for (uint256 i = 0; i < market.totalParticipants; i++) {
             address participant = address(uint160(i));
-            if (userParticipation[_predictionId][participant]) {
-                uint256 totalRefund = 0;
-                for (uint256 j = 0; j < prediction.optionsCount; j++) {
-                    totalRefund += prediction.userVotes[participant][j];
-                    prediction.userVotes[participant][j] = 0;
-                }
-                if (totalRefund > 0) {
-                    payable(participant).transfer(totalRefund * VOTE_VALUE);
-                }
-            }
+            if (!market.hasParticipated[participant]) continue;
+
+            uint256 tokenBalance = winningToken.balanceOf(participant);
+            if (tokenBalance == 0) continue;
+
+            uint256 reward = (tokenBalance * totalLiquidity) / totalSupply;
+            payable(participant).transfer(reward);
+
+            // Update participant profile
+            profiles[participant].totalProfits += reward;
+            profiles[participant].reputation += 10;
         }
-
-        emit PredictionCancelled(_predictionId);
     }
 
-    function withdrawFees(address payable _to, uint256 _amount) external onlyRole(ADMIN_ROLE) {
-        require(_amount <= totalFees, "Insufficient fees collected");
-        totalFees -= _amount;
-        _to.transfer(_amount);
-        emit FeeWithdrawn(_to, _amount);
+    function updatePrices(uint256 marketId) internal {
+        Market storage market = markets[marketId];
+        market.yesPrice = getCurrentPrice(marketId, true);
+        market.noPrice = getCurrentPrice(marketId, false);
     }
 
-    function addValidTag(string memory _tag) external onlyRole(ADMIN_ROLE) {
-        require(!validTags[_tag], "Tag already exists");
-        validTags[_tag] = true;
-        emit TagAdded(_tag);
+    function getCurrentPrice(uint256 marketId, bool isYes) public view returns (uint256) {
+        Market storage market = markets[marketId];
+        MarketPositionToken yesToken = MarketPositionToken(market.yesToken);
+        MarketPositionToken noToken = MarketPositionToken(market.noToken);
+
+        uint256 yesSupply = yesToken.totalSupply();
+        uint256 noSupply = noToken.totalSupply();
+
+        if (yesSupply + noSupply == 0) return 500;
+
+        if (isYes) {
+            return bound((yesSupply * 1000) / (yesSupply + noSupply), 50, 950);
+        } else {
+            return bound((noSupply * 1000) / (yesSupply + noSupply), 50, 950);
+        }
     }
 
-    function removeValidTag(string memory _tag) external onlyRole(ADMIN_ROLE) {
-        require(validTags[_tag], "Tag does not exist");
-        validTags[_tag] = false;
-        emit TagRemoved(_tag);
+    // Social Features
+    function addComment(uint256 marketId, string memory content) external {
+        require(bytes(content).length > 0 && bytes(content).length <= 1000, "Invalid content");
+
+        Market storage market = markets[marketId];
+        uint256 commentId = market.commentCount++;
+
+        Comment storage comment = market.comments[commentId];
+        comment.author = msg.sender;
+        comment.content = content;
+        comment.timestamp = block.timestamp;
+
+        emit CommentAdded(marketId, commentId, msg.sender);
     }
 
-    function getUserStats(address _user) external view returns (UserStats memory) {
-        return userStats[_user];
+    function likeComment(uint256 marketId, uint256 commentId) external {
+        Market storage market = markets[marketId];
+        Comment storage comment = market.comments[commentId];
+
+        require(!comment.hasLiked[msg.sender], "Already liked");
+
+        comment.hasLiked[msg.sender] = true;
+        comment.likes++;
     }
 
-   function getPredictionDetails(uint256 _predictionId) external view returns (
-        string memory description,
-        uint256 endTime,
-        PredictionStatus status,
-        uint256[] memory totalVotes,
-        uint256 outcome,
-        uint256 minVotes,
-        uint256 maxVotes,
-        PredictionType predictionType,
-        address creator,
-        uint256 creationTime,
-        string[] memory tags,
-        uint256 optionsCount,
-        uint256 totalBetAmount
-    ) {
-        Prediction storage prediction = predictions[_predictionId];
+    // Admin Functions
+    function setMarketDurationLimits(uint256 _minDuration, uint256 _maxDuration) external onlyRole(ADMIN_ROLE) {
+        require(_minDuration < _maxDuration, "Invalid limits");
+        minMarketDuration = _minDuration;
+        maxMarketDuration = _maxDuration;
+    }
+
+    function addVerifiedCategory(string memory category) external onlyRole(ADMIN_ROLE) {
+        verifiedCategories[category] = true;
+    }
+
+    function verifyCreator(address creator) external onlyRole(ADMIN_ROLE) {
+        verifiedCreators[creator] = true;
+    }
+
+    function setDisputeThreshold(uint256 threshold) external onlyRole(ADMIN_ROLE) {
+        disputeResolutionThreshold = threshold;
+    }
+
+    // View Functions
+    function getMarketDetails(uint256 marketId)
+        external
+        view
+        returns (
+            string memory description,
+            string memory category,
+            uint256 endTime,
+            MarketStatus status,
+            uint256 totalLiquidity,
+            uint256 totalVolume,
+            uint256 totalParticipants,
+            address creator,
+            string[] memory tags,
+            DisputeStatus disputeStatus
+        )
+    {
+        Market storage market = markets[marketId];
         return (
-            prediction.description,
-            prediction.endTime,
-            prediction.status,
-            prediction.totalVotes,
-            prediction.outcome,
-            prediction.minVotes,
-            prediction.maxVotes,
-            prediction.predictionType,
-            prediction.creator,
-            prediction.creationTime,
-            prediction.tags,
-            prediction.optionsCount,
-            prediction.totalBetAmount
+            market.description,
+            market.category,
+            market.endTime,
+            market.status,
+            market.totalLiquidity,
+            market.totalVolume,
+            market.totalParticipants,
+            market.creator,
+            market.tags,
+            market.disputeStatus
         );
     }
 
-    function getUserVotes(uint256 _predictionId, address _user) external view returns (uint256[] memory) {
-        return predictions[_predictionId].userVotes[_user];
+    function getUserPositions(address user, uint256 marketId)
+        external
+        view
+        returns (uint256 yesTokens, uint256 noTokens, uint256 totalInvested, uint256[] memory limitOrderIds)
+    {
+        UserPosition storage position = markets[marketId].positions[user];
+        return (position.yesTokens, position.noTokens, position.totalInvested, position.limitOrders);
     }
 
-    function hasUserParticipated(uint256 _predictionId, address _user) external view returns (bool) {
-        return userParticipation[_predictionId][_user];
+    // Utility Functions
+    function bound(uint256 value, uint256 min, uint256 max) internal pure returns (uint256) {
+        if (value < min) return min;
+        if (value > max) return max;
+        return value;
     }
 
-    function calculatePotentialWinnings(uint256 _predictionId, uint256 _option, uint256 _votes) external view returns (uint256) {
-        Prediction storage prediction = predictions[_predictionId];
-        require(prediction.status == PredictionStatus.ACTIVE, "Prediction is not active");
-        require(_option < prediction.optionsCount, "Invalid option");
-
-        uint256 totalBetWithNewVotes = prediction.totalBetAmount + (_votes * VOTE_VALUE);
-        uint256 fee = (totalBetWithNewVotes * FEE_PERCENTAGE) / 1000;
-        uint256 rewardPool = totalBetWithNewVotes - fee;
-
-        uint256 optionVotesWithNew = prediction.totalVotes[_option] + _votes;
-        return ((_votes * rewardPool) / optionVotesWithNew);
+    function getMarketIds() external view returns (uint256) {
+        return _marketIds;
     }
 
-    // Role management functions
-    function grantPredictorRole(address _account) external onlyRole(ADMIN_ROLE) {
-        grantRole(PREDICTOR_ROLE, _account);
+    function toString(uint256 value) internal pure returns (string memory) {
+        if (value == 0) return "0";
+
+        uint256 temp = value;
+        uint256 digits;
+        while (temp != 0) {
+            digits++;
+            temp /= 10;
+        }
+
+        bytes memory buffer = new bytes(digits);
+        while (value != 0) {
+            digits -= 1;
+            buffer[digits] = bytes1(uint8(48 + uint256(value % 10)));
+            value /= 10;
+        }
+
+        return string(buffer);
     }
 
-    function revokePredictorRole(address _account) external onlyRole(ADMIN_ROLE) {
-        revokeRole(PREDICTOR_ROLE, _account);
-    }
-
-    function grantModRole(address _account) external onlyRole(ADMIN_ROLE) {
-        grantRole(MOD_ROLE, _account);
-    }
-
-    function revokeModRole(address _account) external onlyRole(ADMIN_ROLE) {
-        revokeRole(MOD_ROLE, _account);
-    }
-
-    function grantOracleRole(address _account) external onlyRole(ADMIN_ROLE) {
-        grantRole(ORACLE_ROLE, _account);
-    }
-
-    function revokeOracleRole(address _account) external onlyRole(ADMIN_ROLE) {
-        revokeRole(ORACLE_ROLE, _account);
-    }
-
+    // Fallback and Receive
     receive() external payable {}
+    fallback() external payable {}
 }
+

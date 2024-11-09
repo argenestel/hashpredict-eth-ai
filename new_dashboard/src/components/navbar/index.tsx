@@ -4,7 +4,7 @@ import { useRouter } from 'next/navigation';
 import { motion, AnimatePresence } from 'framer-motion';
 import { DynamicWidget } from '@dynamic-labs/sdk-react-core';
 import {usePrivy, useWallets} from '@privy-io/react-auth';
-import WalletButton from "./WalletButton.tsx";
+import WalletButton from "./WalletButton";
 const NavBar = ({ isMobile }) => {
   const [activeTab, setActiveTab] = useState('predict');
   const [showTutorial, setShowTutorial] = useState(false);
